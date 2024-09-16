@@ -7,8 +7,9 @@ defmodule Safetensors do
       iex> x = Nx.tensor([1, 2, 3])
       iex> y = Nx.tensor([1.0, 2.0, 3.0])
       iex> tensors = %{"x" => x, "y" => y}
-      iex> data = Safetensors.dump(tensors)
-      iex> tensors = Safetensors.load!(data)
+      iex> metadata = %{"version" => "1.0", "description" => "Sample tensors"}
+      iex> data = Safetensors.dump(tensors, metadata)
+      iex> {tensors, metadata} = Safetensors.load!(data)
       iex> tensors["x"]
       #Nx.Tensor<
         s64[3]
@@ -19,6 +20,8 @@ defmodule Safetensors do
         f32[3]
         [1.0, 2.0, 3.0]
       >
+      iex> metadata
+      %{"version" => "1.0", "description" => "Sample tensors"}
 
   """
 
@@ -44,13 +47,13 @@ defmodule Safetensors do
   @dtype_to_type for {k, v} <- @type_to_dtype, into: %{}, do: {v, k}
 
   @doc """
-  Writes a map of tensors to a file.
+  Writes a map of tensors and optional metadata to a file.
 
   Tensors are written into the file one by one, without the need to
   dump all of them into the memory at once.
   """
-  @spec write!(path :: Path.t(), %{String.t() => Nx.Tensor.t()}) :: :ok
-  def write!(path, tensors) when is_map(tensors) do
+  @spec write!(path :: Path.t(), %{String.t() => Nx.Tensor.t()}, metadata :: map() | nil) :: :ok
+  def write!(path, tensors, metadata \\ nil) when is_map(tensors) do
     File.open!(path, [:write, :raw], fn file ->
       tensors = Enum.sort(tensors)
 
@@ -58,6 +61,8 @@ defmodule Safetensors do
         Enum.map_reduce(tensors, 0, fn {tensor_name, tensor}, offset ->
           tensor_header_entry(tensor_name, tensor, offset)
         end)
+
+      header_entries = maybe_add_metadata(header_entries, metadata)
 
       :ok = :file.write(file, header_binary(header_entries))
 
@@ -67,6 +72,11 @@ defmodule Safetensors do
     end)
 
     :ok
+  end
+
+  defp maybe_add_metadata(header_entries, nil), do: header_entries
+  defp maybe_add_metadata(header_entries, metadata) when is_map(metadata) do
+    [{@header_metadata_key, metadata} | header_entries]
   end
 
   defp tensor_header_entry(tensor_name, tensor, offset) do
@@ -108,14 +118,14 @@ defmodule Safetensors do
   end
 
   @doc """
-  Serializes the given map of tensors to iodata.
+  Serializes the given map of tensors and optional metadata to iodata.
 
   `iodata` is a list of binaries that can be written to any IO device,
   such as a file or a socket. You can ensure the result is a binary by
   calling `IO.iodata_to_binary/1`.
   """
-  @spec dump(%{String.t() => Nx.Tensor.t()}) :: iodata()
-  def dump(tensors) when is_map(tensors) do
+  @spec dump(%{String.t() => Nx.Tensor.t()}, metadata :: map() | nil) :: iodata()
+  def dump(tensors, metadata \\ nil) when is_map(tensors) do
     tensors = Enum.sort(tensors)
 
     {header_entries, {buffer, _offset}} =
@@ -125,11 +135,13 @@ defmodule Safetensors do
         {header_entry, {[buffer, binary], end_offset}}
       end)
 
+    header_entries = maybe_add_metadata(header_entries, metadata)
+
     [header_binary(header_entries), buffer]
   end
 
   @doc """
-  Reads a serialized map of tensors from a file.
+  Reads a serialized map of tensors and metadata from a file.
 
   Tensors are loaded into Nx one by one, without the need to load the
   entire file from disk into memory.
@@ -142,7 +154,7 @@ defmodule Safetensors do
       it is read from the file. Defaults to `false`
 
   """
-  @spec read!(path :: Path.t(), keyword()) :: %{String.t() => Nx.LazyContainer.t()}
+  @spec read!(path :: Path.t(), keyword()) :: {%{String.t() => Nx.LazyContainer.t()}, map() | nil}
   def read!(path, opts \\ []) do
     opts = Keyword.validate!(opts, lazy: false)
 
@@ -150,41 +162,44 @@ defmodule Safetensors do
       {:ok, <<header_size::unsigned-64-integer-little>>} = :file.read(file, 8)
       {:ok, header_json} = :file.read(file, header_size)
 
-      header = decode_header!(header_json)
+      {metadata, header} = decode_header!(header_json)
 
-      for {tensor_name, tensor_info} <- header, into: %{} do
-        %{"data_offsets" => [offset_start, offset_end]} = tensor_info
+      tensors =
+        for {tensor_name, tensor_info} <- header, into: %{} do
+          %{"data_offsets" => [offset_start, offset_end]} = tensor_info
 
-        {shape, type} = shape_and_type(tensor_info)
+          {shape, type} = shape_and_type(tensor_info)
 
-        byte_offset = header_size + 8 + offset_start
-        byte_size = offset_end - offset_start
+          byte_offset = header_size + 8 + offset_start
+          byte_size = offset_end - offset_start
 
-        value =
-          if opts[:lazy] do
-            %Safetensors.FileTensor{
-              shape: shape,
-              type: type,
-              path: path,
-              byte_offset: byte_offset,
-              byte_size: byte_size
-            }
-          else
-            {:ok, binary} = :file.pread(file, byte_offset, byte_size)
-            Shared.build_tensor(binary, shape, type)
-          end
+          value =
+            if opts[:lazy] do
+              %Safetensors.FileTensor{
+                shape: shape,
+                type: type,
+                path: path,
+                byte_offset: byte_offset,
+                byte_size: byte_size
+              }
+            else
+              {:ok, binary} = :file.pread(file, byte_offset, byte_size)
+              Shared.build_tensor(binary, shape, type)
+            end
 
-        {tensor_name, value}
-      end
+          {tensor_name, value}
+        end
+
+      {tensors, metadata}
     end)
   end
 
   @doc """
-  Loads a serialized map of tensors.
+  Loads a serialized map of tensors and metadata.
 
-  It is the opposite of `dump/1`.
+  It is the opposite of `dump/2`.
   """
-  @spec load!(iodata()) :: %{String.t() => Nx.Tensor.t()}
+  @spec load!(iodata()) :: {%{String.t() => Nx.Tensor.t()}, map() | nil}
   def load!(data) when is_binary(data) or is_list(data) do
     data = IO.iodata_to_binary(data)
 
@@ -194,28 +209,27 @@ defmodule Safetensors do
       buffer::binary
     >> = data
 
-    header = decode_header!(header_json)
+    {metadata, header} = decode_header!(header_json)
 
-    for {tensor_name, tensor_info} <- header, into: %{} do
-      %{"data_offsets" => [offset_start, offset_end]} = tensor_info
-      {shape, type} = shape_and_type(tensor_info)
+    tensors =
+      for {tensor_name, tensor_info} <- header, into: %{} do
+        %{"data_offsets" => [offset_start, offset_end]} = tensor_info
+        {shape, type} = shape_and_type(tensor_info)
 
-      tensor =
-        buffer
-        |> binary_slice(offset_start, offset_end - offset_start)
-        |> Shared.build_tensor(shape, type)
+        tensor =
+          buffer
+          |> binary_slice(offset_start, offset_end - offset_start)
+          |> Shared.build_tensor(shape, type)
 
-      {tensor_name, tensor}
-    end
+        {tensor_name, tensor}
+      end
+
+    {tensors, metadata}
   end
 
   defp decode_header!(header_json) do
-    {_metadata, header} =
-      header_json
-      |> Jason.decode!()
-      |> Map.pop(@header_metadata_key)
-
-    header
+    header = Jason.decode!(header_json)
+    Map.pop(header, @header_metadata_key)
   end
 
   defp shape_and_type(%{"dtype" => dtype, "shape" => shape}) do
